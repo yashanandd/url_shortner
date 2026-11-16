@@ -1,37 +1,17 @@
 services:
-  postgres:
-    image: postgres:16-alpine
-    container_name: linkflow_postgres
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: linkflow_backend
     restart: unless-stopped
-    environment:
-      POSTGRES_DB: ${POSTGRES_DB:-linkflow}
-      POSTGRES_USER: ${POSTGRES_USER:-linkflow}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-linkflow_password}
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - "8000:8000"
+    env_file:
+      - ./backend/.env
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-linkflow} -d ${POSTGRES_DB:-linkflow}"]
-      interval: 5s
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
       timeout: 5s
-      retries: 5
-
-  redis:
-    image: redis:7-alpine
-    container_name: linkflow_redis
-    restart: unless-stopped
-    command: redis-server --appendonly yes
-    ports:
-      - "${REDIS_PORT:-6379}:6379"
-    volumes:
-      - redis_data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
-volumes:
-  postgres_data:
-  redis_data:
+      retries: 3
+      start_period: 20s
