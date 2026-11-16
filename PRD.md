@@ -118,9 +118,9 @@ Requirements:
 
 ### FR-03: Short Code Generation
 
-The system should generate unique identifiers for every shortened URL.
+The system generates unique identifiers for every shortened URL.
 
-Proposed approach: Base62 encoding
+Selected approach: Cryptographically secure random Base62 string (7 characters, ~3.52 trillion combinations)
 
 Character set:
 
@@ -128,25 +128,13 @@ Character set:
 0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ
 ```
 
-Example:
-
-```
-Database ID: 125789
-
-Base62: 2Z3z
-
-Short URL: lnk.to/2Z3z
-```
-
 Requirements:
 
-- Codes must be unique.
-- Codes should be URL-safe.
-- Avoid predictable sequential identifiers where possible.
-- Handle collisions safely.
-- Support future horizontal scaling.
-
-For production, use a distributed ID generator or collision-checked random identifiers rather than relying on a single database's auto-increment counter.
+- Length: 7 characters (e.g. `lnk.to/aB92xK7`).
+- Randomness: Cryptographically secure (`secrets.choice` / CSPRNG) to prevent sequential guessing and scraping.
+- Collision handling: Database unique index on `short_code` with automatic retry mechanism (up to 3 attempts on collision).
+- Custom aliases: User-defined aliases (3-30 chars, alphanumeric + hyphens) validated against reserved keywords and existing codes.
+- High capacity: $62^7 \approx 3.52 \times 10^{12}$ unique URLs, providing ample namespace before collision probability rises.
 
 ### FR-04: URL Redirection
 
@@ -388,41 +376,41 @@ Important architectural decision: The redirect path should not wait for analytic
 
 ## 6. Technology Stack
 
-Considering a backend-oriented implementation, this is the recommended stack.
+Aligned with the workspace scaffold and architectural design decisions.
 
 Frontend
 
-Next.js, TypeScript, Tailwind CSS
+React 19, Vite, Tailwind CSS, React Router v6, Lucide Icons, Recharts
 
 Backend
 
-Node.js, Express.js, TypeScript
+Python 3.10+, FastAPI, Uvicorn, Pydantic v2
 
-Database
+Database & Migrations
 
-PostgreSQL, Prisma ORM
+PostgreSQL, SQLAlchemy 2.0 (asyncio + asyncpg), Alembic migrations
 
-Caching
+Caching & Rate Limiting
 
-Redis
+Redis (URL metadata cache, 60s negative caching for 404s, sliding-window rate limiting)
 
-Message Queue
+Message Queue & Buffering (Level 1)
 
-Apache Kafka
+Redis Streams (`XADD` in redirect path with background consumer worker; modular path to Apache Kafka in Level 2)
 
-Authentication
+Authentication & Security
 
-JWT, bcrypt / Argon2
+Dual-token JWT (short-lived access tokens + Redis-tracked refresh tokens with revocation), Argon2 / bcrypt hashing, SSRF private IP filter, reserved route blocklist
 
 Infrastructure
 
-Docker, Kubernetes, Nginx
+Docker Compose (PostgreSQL & Redis for local dev + fully containerized production option)
 
 CI/CD
 
 GitHub Actions
 
-Monitoring
+Monitoring & Metrics
 
 Prometheus, Grafana, OpenTelemetry
 
@@ -559,53 +547,60 @@ Example:
 
 ```
 Key: url:abc123
-Value: https://example.com/products
-TTL: 3600 seconds
+Value: {"destination": "https://example.com/products", "status": "ACTIVE", "expires_at": null}
+TTL: 86400 seconds (24 hours)
 ```
 
-Additional considerations:
+Negative caching example (stampede & scan prevention):
 
-- Cache invalidation when URLs change.
-- Delete cache entries when links are disabled.
-- Prevent cache stampedes.
-- Use negative caching carefully for nonexistent codes.
-- Avoid indefinite caching of expiring links.
-- Use distributed Redis infrastructure with appropriate failover.
+```
+Key: url:unknownCode
+Value: {"status": "NOT_FOUND"}
+TTL: 60 seconds
+```
+
+Caching rules:
+
+- Metadata caching: Destination URL, status, and expiration stored together to eliminate DB lookups on redirect hits.
+- Active invalidation: Update or deletion of a link immediately evicts or updates `url:{code}` in Redis.
+- Negative caching: 404 cache misses store `NOT_FOUND` with 60-second TTL to protect PostgreSQL against brute-force code scanning.
+- Prevent stampedes: Redis connection pooling and lightweight mutex/singleflight if cache warms under viral load.
 
 ## 11. Analytics Processing
 
-Analytics should be event-driven.
+Analytics is strictly decoupled and asynchronous to guarantee sub-millisecond redirect processing.
+
+Level 1 implementation: Redis Streams + Async Consumer Worker (upgrades smoothly to Apache Kafka in Level 2)
 
 Processing flow:
 
-1. A redirect request arrives.
-2. The redirect service resolves the destination.
-3. A click event is published to Kafka.
-4. A worker consumes the event.
-5. The worker extracts device, browser and geographic information.
-6. Aggregated metrics are updated.
-7. The dashboard queries the aggregated data.
+1. A redirect request arrives at `GET /{code}`.
+2. Fast destination lookup in Redis cache (fallback to DB on miss).
+3. Immediate non-blocking `XADD` of the raw click event to Redis Stream `clicks:stream`.
+4. HTTP 302 redirect returned to client immediately (< 25ms p95).
+5. Background worker consumes event batches from `clicks:stream` via Redis Consumer Groups.
+6. Worker parses User-Agent (device, browser, OS), resolves approximate Geo-IP via local MaxMind GeoLite2 mmdb (or CDN headers), and hashes IP for privacy compliance.
+7. Worker writes click logs and updates daily aggregates in PostgreSQL.
 
-Example event:
+Example event in stream:
 
-```
+```json
 {
   "shortCode": "abc123",
-  "timestamp": "2026-11-03T12:00:00Z",
+  "timestamp": "2026-11-16T09:50:00Z",
   "country": "IN",
   "device": "mobile",
   "browser": "Chrome",
-  "referrer": "google.com"
+  "referrer": "google.com",
+  "ipHash": "a94f6f...salted"
 }
 ```
 
 Reliability requirements:
 
-- At-least-once event delivery.
-- Idempotent event processing.
-- Dead-letter queue for failed events.
-- Retry mechanism.
-- Event retention and replay capabilities.
+- At-least-once delivery via Redis Consumer Group ACK (`XACK`).
+- Unprocessed message recovery (`XAUTOCLAIM` for dead workers).
+- Batch inserts to PostgreSQL to minimize database transaction overhead.
 
 ## 12. User Interface Requirements
 
@@ -784,16 +779,18 @@ I recommend building this in three levels rather than implementing every compone
 
 Level 1 – Must build
 
-Functional production-ready core
+Functional production-ready core:
 
-- Node.js + Express + TypeScript
-- PostgreSQL + Prisma
-- Redis caching
-- JWT authentication
-- URL generation and redirection
-- Link management
-- Basic analytics
-- Docker deployment
+- Python 3.10+ & FastAPI async API
+- PostgreSQL + SQLAlchemy 2.0 (asyncio + asyncpg) + Alembic migrations
+- Redis metadata caching & 60s negative caching (anti-stampede)
+- Dual-token JWT authentication (access + Redis-tracked refresh tokens)
+- Cryptographic 7-char Base62 URL generation & sub-millisecond redirection
+- Link management dashboard (React 19 + Vite + Tailwind CSS + Recharts)
+- Redis Streams async click tracking & worker batch ingestion
+- SSRF private/loopback IP filtering and reserved path guards
+- Redis-backed sliding window rate limiter
+- Hybrid Docker Compose setup (Postgres + Redis)
 
   Level 2 – Strong engineering depth
 
